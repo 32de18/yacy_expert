@@ -1,0 +1,7 @@
+[
+  {
+    "job_id": "crawler_job_5432106581093974470",
+    "ftp_url": "ftp://yons:123@192.168.3.141/home/yons/yacy/test1/",
+    "cron": null
+  }
+]

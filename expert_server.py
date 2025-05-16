@@ -2,165 +2,218 @@ import os
 import json
 import requests
 import argparse
-from flask import Flask, request, jsonify, make_response, Response, stream_with_context
+import re
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from urllib.parse import urlparse
-import http.client
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from urllib.parse import urlencode
+from requests.auth import HTTPDigestAuth
+
+CRAWLER_JOBS_FILE = "crawler_jobs.json"
 
 app = Flask(__name__)
 CORS(app)
 
-# default settings
-# run this i.e. with:
-# OPENAI_API_KEY="sk-.." python3 expert_server.py
-YACYSEARCH_HOST = "http://localhost:8094"
-OPENAI_API_HOST = "https://api.openai.com"
-OPENAI_API_KEY  = ""
-RAG = False
-RAG_CONTEXT_PREFIX = "If necessary, use the following context to answer the question. If this text does not match the question, ignore it."
-#RAG_CONTEXT_PREFIX = "Wenn nötig, verwende den folgenden Kontext, um die Frage zu beantworten. Wenn dieser Text nicht zur Frage passt, ignorieren Sie ihn."
-SYSTEM = False
-SYSTEM_CONTEXT_PREFIX = "If necessary, use the following context to answer the question. If this text does not match the question, ignore it."
-SYSTEM_CONTEXT_PATH = "knowledge"
-    
-# overload settings with environment variables in case they are set
-if 'YACYSEARCH_HOST' in os.environ: YACYSEARCH_HOST = os.environ['YACYSEARCH_HOST']
-if 'OPENAI_API_HOST' in os.environ: OPENAI_API_HOST = os.environ['OPENAI_API_HOST']
-if 'OPENAI_API_KEY'  in os.environ: OPENAI_API_KEY  = os.environ['OPENAI_API_KEY']
-if 'RAG_CONTEXT_PREFIX' in os.environ: RAG_CONTEXT_PREFIX = os.environ['RAG_CONTEXT_PREFIX']
+# 默认yacy搜索服务地址
+YACYSEARCH_HOST = "http://192.168.3.141:8090"
+if "YACYSEARCH_HOST" in os.environ:
+    YACYSEARCH_HOST = os.environ["YACYSEARCH_HOST"]
 
-# Implement a protocol-terminating proxy for the OpenAI API:
-# This enables us to add a context to the prompt before it is sent to the OpenAI API using RAG
-@app.route('/v1/chat/completions', methods=['GET', 'POST', 'OPTIONS'])
-def proxy():
-    contextlog = ""
-    if request.method == 'OPTIONS':
-        response = make_response()
-        return response
-    elif request.method in ['GET', 'POST']:
+scheduler = BackgroundScheduler()
+scheduler.start()
 
-        # read the content from the users request that was sent out with chat.html
-        body = request.get_json()
-        messages = body['messages']
-            
-        if SYSTEM and os.path.isdir(SYSTEM_CONTEXT_PATH):
-            # read the content from the users request that was sent out with chat.html
-            systemmessage = messages[0]['content']
-            # read the large context
-            largetext = ""
-            for filename in os.listdir(SYSTEM_CONTEXT_PATH):
-                if filename.endswith(".txt") or filename.endswith(".md"):
-                    with open(os.path.join(SYSTEM_CONTEXT_PATH, filename), 'r') as f: largetext += f.read() + '\n\n'
-            # patch the system message
-            messages[0]['content'] = systemmessage + '\n\n' + SYSTEM_CONTEXT_PREFIX + '\n\n' + largetext
-            print(systemmessage)
-            # todo: set n_keep
+CRAWLER_BASE = "http://192.168.3.141:8090/Crawler_p.html"
 
-        if RAG:
-            # get the content object from the latest message: this is the current prompt
-            prompt = messages[-1]['content']
+# 定时任务的job_id前缀
+CRAWLER_JOB_PREFIX = "crawler_job_"
 
-            # search for a RAG document that matches the prompt
-            try:
-                searchresult = requests.post(YACYSEARCH_HOST + '/yacysearch.json', json={'query': prompt, 'count': 6})
-                context = ""
-                if searchresult.status_code == 200:
-                    try:
-                        # parse the result to json
-                        searchresult_json = json.loads(searchresult.text)
-                        items = searchresult_json['channels'][0]['items']
-                        print(items)
-                        # number of results
-                        hitcount = len(items)
-                        minimum_distance = 70
 
-                        for i in range(0, min(hitcount, 5)):
-                            if items[i]['distance'] < minimum_distance - (i * 10):
-                                description = items[i]['description']
-                                title = items[0]['title']
-                                title = title[0] if isinstance(title, list) and len(title) > 0 else str(title)
-                                if len(description) > 600: description = description[:600] + "..."
-                                context = context + '\n\n' + description
-                                contextlog = contextlog + "&diams; added RAG document: " + title + "\n"
-                    
-                        print(context)
-                        # replace the content object with the enriched content in the body object
-                    except json.decoder.JSONDecodeError as e:
-                        # Handle invalid JSON response from search API
-                        print(f"Error: Search API returned invalid JSON: {e}")
+def save_jobs_to_file():
+    jobs = []
+    for job in scheduler.get_jobs():
+        print(job)
+        if job.id.startswith(CRAWLER_JOB_PREFIX):
+            # crontab字符串保存在job.kwargs['crontab']
+            jobs.append(
+                {
+                    "job_id": job.id,
+                    "ftp_url": job.args[0],
+                    "cron": job.kwargs.get("crontab", None),
+                }
+            )
+    with open(CRAWLER_JOBS_FILE, "w", encoding="utf-8") as f:
+        json.dump(jobs, f, ensure_ascii=False, indent=2)
 
-                    # add the new context to the prompt if the context length is > 0
-                    if len(context) > 0:
-                        prompt = prompt + '\n\n' + RAG_CONTEXT_PREFIX + context
 
-                # write back the enriched prompt to the body object
-                messages[-1]['content'] = prompt
-            except requests.exceptions.ConnectionError as e:
-                # Handle connection error to search API
-                print(f"Error: Search API connection error: {e}")
+def load_jobs_from_file():
+    if not os.path.exists(CRAWLER_JOBS_FILE):
+        return
+    with open(CRAWLER_JOBS_FILE, "r", encoding="utf-8") as f:
+        try:
+            jobs = json.load(f)
+            for job in jobs:
+                job_id = job["job_id"]
+                ftp_url = job["ftp_url"]
+                cron = job["cron"]
+                if not cron:
+                    continue
+                try:
+                    trigger = CronTrigger.from_crontab(cron)
+                    scheduler.add_job(
+                        start_crawler_job,
+                        trigger,
+                        args=[ftp_url],
+                        id=job_id,
+                        replace_existing=True,
+                        crontab=cron,
+                    )
+                except Exception as e:
+                    print(f"恢复定时任务失败: {job_id}, {e}")
+        except Exception as e:
+            print(f"加载定时任务文件失败: {e}")
 
-            # get the body object back into a string
-            body['model'] = "gpt-3.5-turbo"
-            #body['type'] = "json_object"
-            body['stream'] = True # this return format is stream only
-        
-        encoded_body = json.dumps(body).encode('utf-8') 
-        print(encoded_body)
 
-        # Create a connection and send the request
-        api_url = urlparse(OPENAI_API_HOST + "/v1/chat/completions")
+def start_crawler_job(ftp_url):
+    params = {
+        "crawlingstart": "on",
+        "crawlingMode": "url",
+        "crawlingURL": ftp_url,
+        "crawlingDepth": 100,
+        "mustmatch": ".*\\.(doc|docx|ppt|pptx|txt|md|pdf|wps|ofd)$",
+    }
+    try:
+        # 打印实际调用的完整URL
+        full_url = CRAWLER_BASE + "?" + urlencode(params)
+        print(f"即将调用爬虫URL: {full_url}")
+        resp = requests.get(
+            CRAWLER_BASE, params=params, auth=HTTPDigestAuth("admin", "yacy")
+        )
+        print(f"触发爬虫，ftp_url={ftp_url}，状态码={resp.status_code}")
+        return resp.text
+    except Exception as e:
+        print(f"爬虫触发失败: {e}")
+        return str(e)
 
-        #depending on the api_url, make a http or https connection
-        if api_url.scheme == "https":
-            conn = http.client.HTTPSConnection(api_url.netloc)
-        else:
-            conn = http.client.HTTPConnection(api_url.netloc)
-        headers = {key: value for (key, value) in request.headers if key != 'Host'}
-        headers['Content-Type'] = 'application/json'
-        headers['Content-Length'] = str(len(encoded_body)) # content length must be re-computed because it might have changed
-        if OPENAI_API_KEY != "": headers['Authorization'] = 'Bearer ' + OPENAI_API_KEY
-        conn.request("POST", api_url.path, encoded_body, headers)
-        #print("sent request to OpenAI API")
-        
-        # Thread function for reading from the server
-        def read_from_upstream():
-            resp = conn.getresponse()
-            while True:
-                line = resp.readline()
-                if line:
-                    t = line.decode('utf-8')
-                    #print(t)
-                    yield line
-                    if t.find("data: [DONE]") != -1: break
-                else:
-                    break
 
-        return app.response_class(stream_with_context(read_from_upstream()))
+@app.route("/add_crawler_job", methods=["POST"])
+def add_crawler_job():
+    data = request.get_json()
+    ftp_url = data.get("ftp_url")
+    cron = data.get("cron")  # 例如 '0 2 * * *'
+    if not ftp_url or not cron:
+        return jsonify({"error": "ftp_url和cron为必填项"}), 400
+    job_id = CRAWLER_JOB_PREFIX + str(abs(hash(ftp_url + cron)))
+    # 先移除同名任务
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+    trigger = CronTrigger.from_crontab(cron)
+    scheduler.add_job(
+        start_crawler_job,
+        trigger,
+        args=[ftp_url],
+        id=job_id,
+        replace_existing=True,
+        crontab=cron,
+    )
+    save_jobs_to_file()
+    return jsonify({"msg": "定时任务添加成功", "job_id": job_id})
 
+
+@app.route("/list_crawler_jobs", methods=["GET"])
+def list_crawler_jobs():
+    jobs = []
+    for job in scheduler.get_jobs():
+        if job.id.startswith(CRAWLER_JOB_PREFIX):
+            jobs.append(
+                {
+                    "job_id": job.id,
+                    "ftp_url": job.args[0],
+                    "cron": job.kwargs.get("crontab", None),
+                }
+            )
+    return jsonify(jobs)
+
+
+@app.route("/update_crawler_job", methods=["POST"])
+def update_crawler_job():
+    data = request.get_json()
+    job_id = data.get("job_id")
+    new_cron = data.get("cron")
+    if not job_id or not new_cron:
+        return jsonify({"error": "job_id和cron为必填项"}), 400
+    job = scheduler.get_job(job_id)
+    if not job:
+        return jsonify({"error": "未找到该任务"}), 404
+    ftp_url = job.args[0]
+    scheduler.remove_job(job_id)
+    trigger = CronTrigger.from_crontab(new_cron)
+    scheduler.add_job(
+        start_crawler_job,
+        trigger,
+        args=[ftp_url],
+        id=job_id,
+        replace_existing=True,
+        crontab=new_cron,
+    )
+    save_jobs_to_file()
+    return jsonify({"msg": "定时任务已更新", "job_id": job_id})
+
+
+@app.route("/delete_crawler_job", methods=["POST"])
+def delete_crawler_job():
+    data = request.get_json()
+    job_id = data.get("job_id")
+    if not job_id:
+        return jsonify({"error": "job_id为必填项"}), 400
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+        save_jobs_to_file()
+        return jsonify({"msg": "定时任务已删除", "job_id": job_id})
     else:
-        # Unsupported HTTP method
-        return jsonify({'message': 'Method not supported'}), 405
+        return jsonify({"error": "未找到该任务"}), 404
+
+
+@app.route("/yacysearch", methods=["GET"])
+def yacysearch():
+    query = request.args.get("query", "")
+    count = request.args.get("count", 10)
+    print("收到的query：", query)
+    try:
+        # 用GET方式转发到yacy
+        resp = requests.get(
+            f"{YACYSEARCH_HOST}/yacysearch.json",
+            params={"query": query, "count": count},
+        )
+        print("yacy返回状态码：", resp.status_code)
+        print("yacy返回内容：", resp.text)
+        # 提取第一个 { 到最后一个 } 之间的内容
+        match = re.search(r"({.*})", resp.text, re.DOTALL)
+        if match:
+            json_str = match.group(1)
+            return jsonify(json.loads(json_str))
+        else:
+            return jsonify({"error": "未找到合法JSON内容"}), 500
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate text using a specific model.")
-    parser.add_argument("--model", default="gptneo_oetker_trained", type=str, help="Model name of remote LLM")
-    parser.add_argument("--port", default=5001, type=int, help="Port for the reverse proxy server")
-    parser.add_argument("--host", default="0.0.0.0", type=str, help="Local host address")
-    parser.add_argument("--yacy_search_host", default=YACYSEARCH_HOST, type=str, help="http address of search host")
-    parser.add_argument("--openai_api_host", default=OPENAI_API_HOST, type=str, help="http address of ApenAI API")
-    parser.add_argument("--openai_api_key", default=OPENAI_API_KEY, type=str, help="OpenAI API key")
-    parser.add_argument("--rag", default=False, action='store_true', help="Enable RAG (Retrieval Augmented Generation) feature")
-    parser.add_argument("--rag_context_prefix", default=RAG_CONTEXT_PREFIX, type=str, help="Prefix string for RAG context")
-    parser.add_argument("--system", default=False, action='store_true', help="Enable large system context prompts")
-    parser.add_argument("--system_context_prefix", default=SYSTEM_CONTEXT_PREFIX, type=str, help="Prefix string for large system context")
-    parser.add_argument("--system_context_path", default=SYSTEM_CONTEXT_PATH, type=str, help="Path to files to be put into system context")
+    parser = argparse.ArgumentParser(description="Simple YaCy search proxy.")
+    parser.add_argument(
+        "--yacy_search_host",
+        default=YACYSEARCH_HOST,
+        type=str,
+        help="http address of search host",
+    )
+    parser.add_argument("--port", default=5001, type=int, help="Port for the server")
+    parser.add_argument(
+        "--host", default="0.0.0.0", type=str, help="Local host address"
+    )
     args = parser.parse_args()
     YACYSEARCH_HOST = args.yacy_search_host
-    OPENAI_API_HOST = args.openai_api_host
-    OPENAI_API_KEY = args.openai_api_key
-    RAG = args.rag
-    RAG_CONTEXT_PREFIX = args.rag_context_prefix
-    SYSTEM = args.system
-    SYSTEM_CONTEXT_PREFIX = args.system_context_prefix
-    SYSTEM_CONTEXT_PATH = args.system_context_path
+    load_jobs_from_file()
     app.run(host=args.host, port=args.port, debug=True)

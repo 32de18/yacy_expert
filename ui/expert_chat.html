@@ -47,125 +47,47 @@
         var messages = [{ role: 'system', content: 'You are YaCy-Expert, a very polite and helpuf chatbot. If you receive a context to a question, use the given context for the answer if that context is helpful, otherwise ignore it.' }];
 
         async function generateResponse() {
-               var inputText = document.getElementById('inputField').value;
+            var inputText = document.getElementById('inputField').value;
             var fileInput = document.getElementById('fileInput');
             var sendButton = document.getElementById('sendButton');
-            var attachButton = document.getElementById('attachButton');
             sendButton.disabled = true;
-            payload = {
-                model: "gpt-3.5-turbo", temperature: 0.3, max_tokens: 300,
-                messages: [...messages, { role: "user", content: inputText }],
-                stop: ["[/INST]", "<|im_end|>"],
-                stream: true
-            }
-
-            function readFileContent(file) {
-                return new Promise((resolve, reject) => {
-                       const reader = new FileReader();
-                    reader.onload = (event) => resolve(event.target.result);
-                    reader.onerror = (error) => reject(error);
-                    reader.readAsDataURL(file); // or readAsText(file) based on the file type
-                });
-            }
-
-            // Configurable list of strings to be removed if they appear at the end
-            const stringsToRemove = ["[INST]", "<<USER>>", "<</INST>>", "<<SYS>>", "</SYS>>"];
-
-            // Function to remove specific strings from the end of a text
-            function removeStringsFromEnd(text, strings) {
-                for (let str of strings) {
-                    if (text.endsWith(str)) {
-                        // Remove the string from the end
-                        return text.substring(0, text.length - str.length);
-                    }
-                }
-                return text; // Return the original text if no strings are found at the end
-            }
-
-            if (fileInput.files.length > 0) {
-                try {
-                    payload.fileContent = await readFileContent(fileInput.files[0]);
-                    payload.fileName = fileInput.files[0].name
-                } catch (error) {
-                    console.error('Error reading file:', error);
-                }
-            }
-            
             let chat = document.getElementById('chatWindow');
-            chat.innerHTML += `<div class="mb-2">Du: ${inputText}</div>`;
+            chat.innerHTML += `<div class="mb-2">你：${inputText}</div>`;
             document.getElementById('inputField').value = '';
-            messages.push({ role: "user", content: inputText });
 
-            let response = await fetch(apihost + '/v1/chat/completions', {
+            // 发送到yacy搜索接口
+            let response = await fetch(apihost + '/yacysearch.json', {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                 },
-                body: JSON.stringify(payload),
-              });
+                body: JSON.stringify({
+                    query: inputText,
+                    count: 10
+                }),
+            });
 
-            fileInput.value = "";
             sendButton.disabled = false;
-
-            // Create a div to hold the response
             let responseDiv = document.createElement('div');
             responseDiv.classList.add("mb-2");
             chat.appendChild(responseDiv);
-	
+
             if (response.ok) {
-                const reader = response.body.getReader();
-                let decoder = new TextDecoder();
-                let fullOutputText = ""; // Variable to accumulate the full response
-	
-                // Function to process each chunk
-                const processChunk = async () => {
-                    const result = await reader.read();
-                    if (result.done) {
-                        console.log('Stream complete');
-                        messages.push({ role: "assistant", content: fullOutputText });
-                        console.log('Final output text:', fullOutputText); // Debug line
-                        reader.cancel();
-                        return;
+                let data = await response.json();
+                // 适配yacy返回格式，展示搜索结果
+                if (data.channels && data.channels[0] && data.channels[0].items) {
+                    let items = data.channels[0].items;
+                    let html = '<b>YaCy搜索结果：</b><ul>';
+                    for (let item of items) {
+                        html += `<li><a href="${item.link}" target="_blank">${item.title}</a><br><span style='color:#555;'>${item.description}</span></li>`;
                     }
-
-                    let chunk = decoder.decode(result.value, { stream: true });
-                    console.log('Received chunk:', chunk); // Debug line
-
-                    // Split the chunk by newlines and process each line
-                    let lines = chunk.split('\n');
-                    lines.forEach(line => {
-                        // Remove the 'data: ' prefix from the chunk
-                        line = line.replace(/^data: /, '').trim();
-                        if (line) {
-	                    // Check for the end of stream indicator
-                            if (line === '[DONE]') {
-                                console.log('End of data stream');
-                                return;
-                            }
-                        
-                            try {
-                                let json = JSON.parse(line);
-                                if (json.choices[0].delta.content) {
-                                    let outputText = json.choices[0].delta.content;
-                                    fullOutputText = removeStringsFromEnd(fullOutputText + outputText, stringsToRemove);
-                                    console.log(fullOutputText)
-                                    responseDiv.innerHTML = "Expert: "+ marked.parse(fullOutputText, { sanitize: true });
-                                }
-                            } catch (e) {
-                                console.error('Error parsing JSON:', e);
-                                console.error('Problematic line:', line); // Debug line
-                            }
-                        }
-                    });
-                    // Process the next chunk
-                    processChunk();
-                };
-
-                // Start processing the stream
-                processChunk();
+                    html += '</ul>';
+                    responseDiv.innerHTML = html;
+                } else {
+                    responseDiv.innerHTML = '未找到相关结果。';
+                }
             } else {
-                console.error(`Error: ${response.status}`);
-                return null;
+                responseDiv.innerHTML = '搜索出错，状态码：' + response.status;
             }
         }
 
